@@ -1,0 +1,28 @@
+[package]
+name = "fork"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Fork CLI — snapshot, verify, diff, and retrieve the human web"
+
+[[bin]]
+name = "fork"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+anyhow = "1"
+url = "2"
+reqwest = { version = "0.12", features = ["rustls-tls", "gzip", "brotli"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+scraper = "0.20"
+regex = "1"
+walkdir = "2"
