@@ -71,7 +71,7 @@ enum Commands {
     Protocols,
     /// Launch the interactive Web Browser Client server
     Serve {
-        #[arg(short, long, default_value = "0.0.0.0:8080")]
+        #[arg(short, long, default_value = "0.0.0.0:8888")]
         bind: String,
         #[arg(short, long, default_value = "./snapshots")]
         dir: PathBuf,
