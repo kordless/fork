@@ -1,30 +1,32 @@
-//! Built-in Web Browser Client Server for Fork.
+//! Built-in Web Browser Client for Fork.
 //!
-//! Binds to 0.0.0.0:8888 (or specified port) and serves a high-performance,
-//! cyberpunk-themed web browser interface for querying, reconstituting, searching,
-//! and verifying human-entropy web snapshots across all multi-protocol adapters.
+//! Binds to 0.0.0.0 (default :8888) and serves a glassmorphic cyberpunk UI over
+//! live snapshot APIs: `/api/snapshots`, `/api/search`, `/api/get`, `/api/snap`.
 
 use anyhow::{Context, Result};
+use crate::protocols::{extract_links, extract_title, normalize_extraction, ProtocolRegistry};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use url::Url;
 
 pub async fn run_server(bind_addr: &str, snapshots_dir: PathBuf) -> Result<()> {
+    std::fs::create_dir_all(&snapshots_dir).ok();
     let listener = TcpListener::bind(bind_addr)
         .await
-        .with_context(|| format!("Failed to bind to {}", bind_addr))?;
+        .with_context(|| format!("Failed to bind to {bind_addr}"))?;
 
     println!("============================================================");
-    println!("🌐 Fork Web Browser Client running at http://{}", bind_addr);
+    println!("Fork Web Browser Client running at http://{bind_addr}");
     println!("   Snapshots directory: {}", snapshots_dir.display());
     println!("============================================================");
 
     loop {
         let (mut socket, _) = listener.accept().await?;
         let dir_clone = snapshots_dir.clone();
-
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 8192];
+            let mut buf = vec![0u8; 16_384];
             if let Ok(n) = socket.read(&mut buf).await {
                 if n == 0 {
                     return;
@@ -44,74 +46,251 @@ async fn handle_request(req: &str, snapshots_dir: &Path) -> String {
     let mut parts = first_line.split_whitespace();
     let _method = parts.next().unwrap_or("GET");
     let path = parts.next().unwrap_or("/");
+    let path_only = path.split('?').next().unwrap_or(path);
 
-    if path == "/" || path == "/index.html" {
-        return http_response(200, "text/html; charset=utf-8", INDEX_HTML);
-    }
-
-    if path == "/api/snapshots" {
-        let list = list_local_snapshots(snapshots_dir);
-        let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
-        return http_response(200, "application/json", &json);
-    }
-
-    if path.starts_with("/api/search?") {
-        let query = extract_query_param(path, "q").unwrap_or_default();
-        let results = search_snapshots(snapshots_dir, &query);
-        let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".into());
-        return http_response(200, "application/json", &json);
-    }
-
-    if path.starts_with("/api/get?") {
-        let target = extract_query_param(path, "target").unwrap_or_default();
-        if let Ok(snap_json) = get_snapshot_content(snapshots_dir, &target) {
-            return http_response(200, "application/json", &snap_json);
-        } else {
-            return http_response(404, "application/json", r#"{"error":"Snapshot not found"}"#);
+    match path_only {
+        "/" | "/index.html" => http_response(200, "text/html; charset=utf-8", INDEX_HTML),
+        "/api/snapshots" => {
+            let list = list_local_snapshots(snapshots_dir);
+            json_ok(&list)
         }
+        "/api/protocols" => {
+            let schemes = ProtocolRegistry::builtins().schemes();
+            json_ok(&schemes)
+        }
+        "/api/search" => {
+            let query = extract_query_param(path, "q").unwrap_or_default();
+            json_ok(&search_snapshots(snapshots_dir, &query))
+        }
+        "/api/get" => {
+            let target = extract_query_param(path, "target").unwrap_or_default();
+            match get_snapshot_content(snapshots_dir, &target) {
+                Ok(snap_json) => http_response(200, "application/json", &snap_json),
+                Err(_) => json_err(404, "Snapshot not found"),
+            }
+        }
+        "/api/snap" => {
+            let url = extract_query_param(path, "url").unwrap_or_default();
+            if url.is_empty() {
+                return json_err(400, "missing url parameter");
+            }
+            match snap_url(snapshots_dir, &url).await {
+                Ok(val) => json_ok(&val),
+                Err(e) => json_err(502, &e.to_string()),
+            }
+        }
+        _ => http_response(404, "text/plain; charset=utf-8", "404 Not Found"),
     }
+}
 
-    http_response(404, "text/plain", "404 Not Found")
+fn json_ok<T: serde::Serialize>(val: &T) -> String {
+    let body = serde_json::to_string(val).unwrap_or_else(|_| "null".into());
+    http_response(200, "application/json; charset=utf-8", &body)
+}
+
+fn json_err(status: u16, msg: &str) -> String {
+    let body = serde_json::json!({ "error": msg }).to_string();
+    http_response(status, "application/json; charset=utf-8", &body)
 }
 
 fn http_response(status: u16, content_type: &str, body: &str) -> String {
     let status_text = match status {
         200 => "200 OK",
+        400 => "400 Bad Request",
         404 => "404 Not Found",
+        502 => "502 Bad Gateway",
         _ => "500 Internal Server Error",
     };
     format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
-        status_text,
-        content_type,
-        body.len(),
-        body
+        "HTTP/1.1 {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     )
 }
 
 fn extract_query_param(path: &str, key: &str) -> Option<String> {
-    if let Some(idx) = path.find('?') {
-        let query_str = &path[idx + 1..];
-        for pair in query_str.split('&') {
-            let mut kv = pair.split('=');
-            if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
-                if k == key {
-                    return urlencoding_decode(v);
-                }
-            }
-        }
-    }
-    None
+    let query_str = path.split_once('?')?.1;
+    url::form_urlencoded::parse(query_str.as_bytes())
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.into_owned())
 }
 
-fn urlencoding_decode(s: &str) -> Option<String> {
-    url::form_urlencoded::parse(s.as_bytes())
-        .next()
-        .map(|(_, v)| v.into_owned())
+fn sha256_hex(data: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(data)))
+}
+
+fn tailscore_breakdown(target: &str) -> (f32, Vec<serde_json::Value>) {
+    let lower = target.to_lowercase();
+    let mut score: f32 = 0.5;
+    let mut factors = vec![serde_json::json!({
+        "label": "baseline",
+        "delta": 0.5,
+        "note": "neutral prior"
+    })];
+
+    let mut bump = |cond: bool, delta: f32, label: &str, note: &str| {
+        if cond {
+            score += delta;
+            factors.push(serde_json::json!({ "label": label, "delta": delta, "note": note }));
+        }
+    };
+    bump(
+        lower.contains("blog") || lower.contains("personal") || lower.contains("~") || lower.contains("forum"),
+        0.2,
+        "human-corner",
+        "personal / blog / forum markers",
+    );
+    bump(
+        lower.contains("wordpress") || lower.contains("blogspot") || lower.contains("tumblr"),
+        0.1,
+        "indie-cms",
+        "self-hosted / classic CMS",
+    );
+    bump(
+        lower.starts_with("finger:") || lower.starts_with("gopher:") || lower.starts_with("gemini:") || lower.starts_with("news:"),
+        0.15,
+        "long-tail-protocol",
+        "non-web protocol (high entropy, low crawl coverage)",
+    );
+    bump(
+        lower.contains("facebook") || lower.contains("twitter") || lower.contains("instagram") || lower.contains("tiktok"),
+        -0.3,
+        "platform-feed",
+        "centralized social feed",
+    );
+    bump(
+        lower.starts_with("https://github.com") || lower.contains("docs."),
+        -0.1,
+        "engineered-corpus",
+        "highly optimized / generated-adjacent",
+    );
+    score = score.clamp(0.0, 1.0);
+    (score, factors)
+}
+
+fn software_beacon() -> serde_json::Value {
+    let captured_at = chrono::Utc::now().to_rfc3339();
+    let digest = sha256_hex(format!("fork-clock|{captured_at}|WWV-10MHz").as_bytes());
+    serde_json::json!({
+        "digest": digest,
+        "freq_hz": 10_000_000,
+        "station": "WWV",
+        "captured_at": captured_at,
+        "duration_ms": 0,
+        "receiver": "system-clock (RTL-SDR unattached)"
+    })
+}
+
+fn find_prior(dir: &Path, url: &str) -> Option<String> {
+    let mut best: Option<(String, String)> = None; // (fetched_at, body_digest)
+    for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(data) = std::fs::read_to_string(p) else { continue };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
+        if val.get("url").and_then(|u| u.as_str()) != Some(url) {
+            continue;
+        }
+        let fetched = val.get("fetched_at").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let digest = val.get("body_digest").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        if digest.is_empty() {
+            continue;
+        }
+        match &best {
+            Some((prev, _)) if fetched <= *prev => {}
+            _ => best = Some((fetched, digest)),
+        }
+    }
+    best.map(|(_, d)| d)
+}
+
+async fn snap_url(dir: &Path, url_str: &str) -> Result<serde_json::Value> {
+    let registry = ProtocolRegistry::builtins();
+    let payload = registry.fetch(url_str).await?;
+    let body = payload.raw_bytes;
+    let body_digest = sha256_hex(&body);
+    let extraction = if payload.extracted_text.is_empty() {
+        None
+    } else {
+        Some(sha256_hex(payload.extracted_text.as_bytes()))
+    };
+    let final_url = payload
+        .final_url
+        .clone()
+        .unwrap_or_else(|| url_str.to_string());
+    let (title, preview, links) = if payload.title.is_some() || !payload.links.is_empty() {
+        (
+            payload.title.clone(),
+            Some(payload.extracted_text.chars().take(4000).collect::<String>()),
+            payload.links.clone(),
+        )
+    } else if payload
+        .content_type
+        .as_deref()
+        .map(|c| c.contains("html"))
+        .unwrap_or(false)
+    {
+        let parsed = Url::parse(&final_url).ok();
+        let html = String::from_utf8_lossy(&body);
+        (
+            extract_title(&html),
+            Some(normalize_extraction(&html).chars().take(4000).collect()),
+            parsed.map(|u| extract_links(&u, &html)).unwrap_or_default(),
+        )
+    } else {
+        (
+            payload.title.clone(),
+            Some(payload.extracted_text.chars().take(4000).collect()),
+            vec![],
+        )
+    };
+
+    let (score, factors) = tailscore_breakdown(url_str);
+    let prior = find_prior(dir, url_str);
+    let beacon = software_beacon();
+    let fetched_at = chrono::Utc::now().to_rfc3339();
+
+    let snap = serde_json::json!({
+        "spec": "fork-snapshot/0.1",
+        "url": url_str,
+        "fetched_at": fetched_at,
+        "warc_digest": serde_json::Value::Null,
+        "body_digest": body_digest,
+        "extraction_digest": extraction,
+        "content_type": payload.content_type,
+        "status": payload.status,
+        "prior": prior,
+        "tailscore": score,
+        "beacon": beacon,
+        "meta": {
+            "title": title,
+            "text_preview": preview,
+            "links": links,
+            "final_url": final_url,
+            "tailscore_factors": factors,
+            "scheme": Url::parse(url_str).map(|u| u.scheme().to_string()).unwrap_or_default()
+        }
+    });
+
+    std::fs::create_dir_all(dir)?;
+    let short = snap["body_digest"]
+        .as_str()
+        .unwrap_or("unknown")
+        .trim_start_matches("sha256:");
+    let short = &short[..std::cmp::min(16, short.len())];
+    let json_path = dir.join(format!("{short}.json"));
+    let body_path = dir.join(format!("{short}.body"));
+    std::fs::write(&json_path, serde_json::to_string_pretty(&snap)?)?;
+    std::fs::write(&body_path, body)?;
+    Ok(snap)
 }
 
 fn list_local_snapshots(dir: &Path) -> Vec<serde_json::Value> {
     let mut list = Vec::new();
+    if !dir.exists() {
+        return list;
+    }
     for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
         let p = entry.path();
         if p.extension().and_then(|e| e.to_str()) == Some("json") {
@@ -122,521 +301,508 @@ fn list_local_snapshots(dir: &Path) -> Vec<serde_json::Value> {
             }
         }
     }
+    list.sort_by(|a, b| {
+        let ta = a.get("fetched_at").and_then(|s| s.as_str()).unwrap_or("");
+        let tb = b.get("fetched_at").and_then(|s| s.as_str()).unwrap_or("");
+        tb.cmp(ta)
+    });
     list
 }
 
 fn search_snapshots(dir: &Path, query: &str) -> Vec<serde_json::Value> {
     let q = query.to_lowercase();
-    let mut hits = Vec::new();
-    for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
-        let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) == Some("json") {
-            if let Ok(data) = std::fs::read_to_string(p) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
-                    let title = val["meta"]["title"].as_str().unwrap_or("").to_lowercase();
-                    let preview = val["meta"]["text_preview"].as_str().unwrap_or("").to_lowercase();
-                    let url = val["url"].as_str().unwrap_or("").to_lowercase();
-                    if title.contains(&q) || preview.contains(&q) || url.contains(&q) || q.is_empty() {
-                        hits.push(val);
-                    }
-                }
-            }
+    if q.is_empty() {
+        return list_local_snapshots(dir);
+    }
+    let mut hits: Vec<(f32, serde_json::Value)> = Vec::new();
+    for val in list_local_snapshots(dir) {
+        let title = val["meta"]["title"].as_str().unwrap_or("").to_lowercase();
+        let preview = val["meta"]["text_preview"].as_str().unwrap_or("").to_lowercase();
+        let url = val["url"].as_str().unwrap_or("").to_lowercase();
+        let mut score = 0.0f32;
+        if title.contains(&q) {
+            score += 3.0;
+        }
+        if preview.contains(&q) {
+            score += 1.0;
+        }
+        if url.contains(&q) {
+            score += 1.5;
+        }
+        if score > 0.0 {
+            hits.push((score, val));
         }
     }
-    hits
+    hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    hits.into_iter().map(|(_, v)| v).collect()
 }
 
 fn get_snapshot_content(dir: &Path, target: &str) -> Result<String> {
     let needle = target.trim_start_matches("sha256:");
+    if needle.is_empty() {
+        anyhow::bail!("empty target");
+    }
     for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
         let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) == Some("json") {
-            let data = std::fs::read_to_string(p)?;
-            if data.contains(needle) || p.to_string_lossy().contains(needle) {
-                return Ok(data);
-            }
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let data = std::fs::read_to_string(p)?;
+        if data.contains(needle) || p.to_string_lossy().contains(needle) {
+            return Ok(data);
         }
     }
     anyhow::bail!("Not found")
 }
 
-const INDEX_HTML: &str = r#"<!DOCTYPE html>
+const INDEX_HTML: &str = r###"<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Fork — Multi-Protocol Human Web Browser</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --bg-dark: #080a0f;
-      --bg-panel: rgba(15, 20, 32, 0.85);
-      --bg-card: rgba(23, 30, 48, 0.7);
-      --accent-cyan: #00f2fe;
-      --accent-purple: #7928ca;
-      --accent-glow: rgba(0, 242, 254, 0.3);
-      --text: #f8fafc;
-      --text-dim: #94a3b8;
-      --border: rgba(255, 255, 255, 0.12);
-      --font-main: 'Outfit', sans-serif;
-      --font-mono: 'JetBrains Mono', monospace;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      background: var(--bg-dark);
-      background-image: 
-        radial-gradient(circle at 15% 15%, rgba(121, 40, 202, 0.15) 0%, transparent 40%),
-        radial-gradient(circle at 85% 85%, rgba(0, 242, 254, 0.12) 0%, transparent 45%);
-      color: var(--text);
-      font-family: var(--font-main);
-      display: flex;
-      flex-direction: column;
-      height: 100vh;
-      overflow: hidden;
-    }
-    header {
-      background: var(--bg-panel);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-      border-bottom: 1px solid var(--border);
-      padding: 10px 20px;
-      display: flex;
-      align-items: center;
-      gap: 16px;
-      z-index: 10;
-    }
-    .brand {
-      font-weight: 800;
-      font-size: 1.35rem;
-      letter-spacing: -0.5px;
-      background: linear-gradient(135deg, var(--accent-cyan), #4facfe, var(--accent-purple));
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .nav-controls {
-      display: flex;
-      gap: 6px;
-    }
-    .nav-btn {
-      background: rgba(255,255,255,0.05);
-      border: 1px solid var(--border);
-      color: var(--text);
-      width: 32px;
-      height: 32px;
-      border-radius: 6px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 0.9rem;
-      transition: all 0.2s ease;
-    }
-    .nav-btn:hover { background: rgba(255,255,255,0.15); border-color: var(--accent-cyan); }
-    .url-bar-container {
-      flex: 1;
-      display: flex;
-      align-items: center;
-      background: rgba(0, 0, 0, 0.4);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 4px 12px;
-      gap: 10px;
-      transition: all 0.25s ease;
-    }
-    .url-bar-container:focus-within {
-      border-color: var(--accent-cyan);
-      box-shadow: 0 0 16px var(--accent-glow);
-    }
-    .scheme-badge {
-      background: linear-gradient(135deg, rgba(0, 242, 254, 0.2), rgba(121, 40, 202, 0.2));
-      color: var(--accent-cyan);
-      font-family: var(--font-mono);
-      font-size: 0.72rem;
-      padding: 3px 8px;
-      border-radius: 4px;
-      font-weight: 700;
-      letter-spacing: 0.5px;
-      border: 1px solid rgba(0, 242, 254, 0.3);
-    }
-    .url-input {
-      flex: 1;
-      background: transparent;
-      border: none;
-      outline: none;
-      color: var(--text);
-      font-family: var(--font-mono);
-      font-size: 0.88rem;
-    }
-    .btn-go {
-      background: linear-gradient(135deg, #00f2fe, #4facfe);
-      color: #040810;
-      font-weight: 700;
-      border: none;
-      padding: 8px 20px;
-      border-radius: 6px;
-      cursor: pointer;
-      font-family: var(--font-main);
-      transition: all 0.2s ease;
-      box-shadow: 0 0 12px rgba(0, 242, 254, 0.3);
-    }
-    .btn-go:hover { transform: translateY(-1px); filter: brightness(1.15); }
-    .preset-bar {
-      background: rgba(0,0,0,0.3);
-      border-bottom: 1px solid var(--border);
-      padding: 6px 20px;
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      font-size: 0.78rem;
-      color: var(--text-dim);
-    }
-    .preset-pill {
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid var(--border);
-      padding: 3px 10px;
-      border-radius: 12px;
-      cursor: pointer;
-      font-family: var(--font-mono);
-      color: var(--text-dim);
-      transition: all 0.2s ease;
-    }
-    .preset-pill:hover { color: var(--accent-cyan); border-color: var(--accent-cyan); background: rgba(0,242,254,0.1); }
-    main {
-      flex: 1;
-      display: grid;
-      grid-template-columns: 320px 1fr 340px;
-      height: calc(100vh - 95px);
-    }
-    .sidebar {
-      background: var(--bg-panel);
-      backdrop-filter: blur(12px);
-      border-right: 1px solid var(--border);
-      display: flex;
-      flex-direction: column;
-    }
-    .sidebar-header {
-      padding: 14px;
-      border-bottom: 1px solid var(--border);
-    }
-    .search-box {
-      width: 100%;
-      background: rgba(0,0,0,0.5);
-      border: 1px solid var(--border);
-      color: var(--text);
-      padding: 8px 12px;
-      border-radius: 6px;
-      font-family: var(--font-main);
-      outline: none;
-      font-size: 0.85rem;
-    }
-    .search-box:focus { border-color: var(--accent-cyan); }
-    .snapshot-list {
-      flex: 1;
-      overflow-y: auto;
-      padding: 10px;
-    }
-    .snap-card {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px;
-      margin-bottom: 8px;
-      cursor: pointer;
-      transition: all 0.2s ease;
-    }
-    .snap-card:hover { border-color: var(--accent-cyan); transform: translateX(3px); background: rgba(0, 242, 254, 0.08); }
-    .snap-card.active { border-color: var(--accent-cyan); background: rgba(0, 242, 254, 0.12); }
-    .snap-title { font-weight: 600; font-size: 0.92rem; margin-bottom: 4px; color: var(--text); }
-    .snap-url { font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .viewport {
-      background: rgba(5, 7, 12, 0.95);
-      display: flex;
-      flex-direction: column;
-      overflow-y: auto;
-      padding: 24px;
-    }
-    .viewport-header {
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 16px;
-      margin-bottom: 20px;
-    }
-    .view-title { font-size: 1.7rem; font-weight: 800; margin-bottom: 8px; letter-spacing: -0.5px; }
-    .view-meta-bar { display: flex; gap: 16px; font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-dim); flex-wrap: wrap; }
-    .view-body {
-      background: var(--bg-panel);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 24px;
-      font-family: var(--font-mono);
-      font-size: 0.9rem;
-      line-height: 1.7;
-      white-space: pre-wrap;
-      flex: 1;
-      overflow-y: auto;
-      box-shadow: inset 0 0 20px rgba(0,0,0,0.5);
-    }
-    .inspector {
-      background: var(--bg-panel);
-      backdrop-filter: blur(12px);
-      border-left: 1px solid var(--border);
-      padding: 20px;
-      display: flex;
-      flex-direction: column;
-      gap: 18px;
-      overflow-y: auto;
-    }
-    .inspect-section {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 14px;
-    }
-    .inspect-title { font-size: 0.8rem; text-transform: uppercase; font-weight: 700; color: var(--accent-cyan); margin-bottom: 10px; letter-spacing: 0.8px; }
-    .hash-badge {
-      background: rgba(0,0,0,0.6);
-      font-family: var(--font-mono);
-      font-size: 0.74rem;
-      padding: 8px;
-      border-radius: 6px;
-      word-break: break-all;
-      color: var(--accent-cyan);
-      border: 1px solid var(--border);
-    }
-    .tailscore-bar {
-      height: 8px;
-      background: rgba(255,255,255,0.1);
-      border-radius: 4px;
-      overflow: hidden;
-      margin-top: 6px;
-    }
-    .tailscore-fill {
-      height: 100%;
-      background: linear-gradient(90deg, #ff416c, #8a2387, var(--accent-cyan));
-      width: 0%;
-      transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
-    }
-    .protocol-grid {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 8px;
-    }
-    .proto-item {
-      background: rgba(0,0,0,0.5);
-      border: 1px solid var(--border);
-      padding: 6px 10px;
-      border-radius: 6px;
-      font-family: var(--font-mono);
-      font-size: 0.72rem;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #10b981; box-shadow: 0 0 8px #10b981; }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fork — Web Browser for Human Entropy</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --void: #06080d;
+  --panel: rgba(12, 16, 28, 0.62);
+  --card: rgba(18, 24, 42, 0.55);
+  --cyan: #00f2fe;
+  --blue: #4facfe;
+  --purple: #9d4edd;
+  --pink: #ff4d8d;
+  --text: #f1f5f9;
+  --muted: #8b9bb4;
+  --line: rgba(0, 242, 254, 0.18);
+  --glow: 0 0 24px rgba(0, 242, 254, 0.18);
+  --font: "Outfit", sans-serif;
+  --mono: "JetBrains Mono", monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  font-family: var(--font);
+  color: var(--text);
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(157, 78, 221, 0.22), transparent 55%),
+    radial-gradient(900px 500px at 110% 10%, rgba(0, 242, 254, 0.16), transparent 50%),
+    linear-gradient(180deg, #070910 0%, var(--void) 100%);
+  overflow: hidden;
+}
+body::before {
+  content: "";
+  pointer-events: none;
+  position: fixed; inset: 0;
+  background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.08) 3px);
+  opacity: 0.35;
+}
+.glass {
+  background: var(--panel);
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  border: 1px solid var(--line);
+  box-shadow: var(--glow), inset 0 1px 0 rgba(255,255,255,0.04);
+}
+.app { display: flex; flex-direction: column; height: 100vh; }
+header.chrome {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px;
+  z-index: 20;
+}
+.wordmark {
+  font-weight: 800; letter-spacing: 0.08em; font-size: 13px;
+  background: linear-gradient(90deg, var(--cyan), var(--blue), var(--purple));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  white-space: nowrap;
+}
+.nav-btns { display: flex; gap: 6px; }
+.icon-btn {
+  width: 34px; height: 34px; border-radius: 10px;
+  border: 1px solid var(--line); background: rgba(255,255,255,0.03);
+  color: var(--text); cursor: pointer; font-size: 14px;
+  transition: 0.18s ease; font-family: var(--mono);
+}
+.icon-btn:hover { border-color: var(--cyan); box-shadow: var(--glow); color: var(--cyan); }
+.icon-btn:disabled { opacity: 0.35; cursor: default; box-shadow: none; }
+.url-wrap {
+  flex: 1; display: flex; align-items: center; gap: 8px;
+  padding: 4px 10px; border-radius: 14px; min-width: 0;
+  border: 1px solid var(--line); background: rgba(0,0,0,0.35);
+  transition: 0.2s ease;
+}
+.url-wrap:focus-within { border-color: var(--cyan); box-shadow: var(--glow); }
+.scheme {
+  font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: 0.12em;
+  padding: 4px 8px; border-radius: 999px;
+  border: 1px solid rgba(0,242,254,0.35);
+  background: linear-gradient(135deg, rgba(0,242,254,0.16), rgba(157,78,221,0.16));
+  color: var(--cyan); display: flex; align-items: center; gap: 6px;
+}
+.scheme .pulse {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--cyan);
+  box-shadow: 0 0 10px var(--cyan); animation: pulse 1.6s ease infinite;
+}
+@keyframes pulse { 50% { opacity: 0.35; transform: scale(0.8); } }
+#urlInput {
+  flex: 1; min-width: 0; background: transparent; border: 0; outline: 0;
+  color: var(--text); font-family: var(--mono); font-size: 13px;
+}
+.go {
+  border: 0; border-radius: 12px; padding: 8px 16px; cursor: pointer;
+  font-family: var(--font); font-weight: 700;
+  background: linear-gradient(135deg, var(--cyan), var(--blue) 55%, var(--purple));
+  color: #041018; box-shadow: var(--glow);
+}
+.go:hover { filter: brightness(1.08); }
+.go.busy { opacity: 0.7; }
+.tabs {
+  display: flex; gap: 6px; padding: 0 14px 8px; overflow-x: auto;
+}
+.tab {
+  font-size: 12px; padding: 6px 10px; border-radius: 10px; cursor: pointer;
+  border: 1px solid transparent; color: var(--muted); white-space: nowrap;
+  background: rgba(255,255,255,0.03); max-width: 180px; overflow: hidden; text-overflow: ellipsis;
+}
+.tab.on { color: var(--text); border-color: var(--cyan); box-shadow: var(--glow); }
+.presets {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  padding: 8px 14px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+}
+.presets label { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
+.pill {
+  font-family: var(--mono); font-size: 11px; padding: 5px 10px; border-radius: 999px;
+  border: 1px solid var(--line); background: rgba(255,255,255,0.03); color: var(--muted);
+  cursor: pointer; transition: 0.18s ease;
+}
+.pill:hover { color: var(--cyan); border-color: var(--cyan); }
+.stage {
+  flex: 1; display: grid; grid-template-columns: minmax(220px, 280px) 1fr minmax(260px, 340px);
+  min-height: 0;
+}
+.col { min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.sidebar { border-right: 1px solid var(--line); }
+.inspector { border-left: 1px solid var(--line); }
+.col-h { padding: 12px 12px 8px; font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--muted); }
+#searchInput {
+  margin: 0 12px 10px; padding: 8px 10px; border-radius: 10px;
+  border: 1px solid var(--line); background: rgba(0,0,0,0.35); color: var(--text);
+  font-family: var(--font); outline: none;
+}
+#snapshotList { flex: 1; overflow: auto; padding: 0 10px 12px; }
+.card {
+  padding: 10px; border-radius: 12px; margin-bottom: 8px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--card);
+  animation: rise 0.35s ease;
+}
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } }
+.card:hover, .card.on { border-color: var(--cyan); }
+.card h4 { font-size: 13px; font-weight: 600; }
+.card p { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.empty { padding: 16px; color: var(--muted); font-size: 13px; }
+.viewport { padding: 18px; overflow: auto; }
+.v-title { font-size: clamp(18px, 2.4vw, 28px); font-weight: 800; letter-spacing: -0.03em; }
+.v-meta { display: flex; flex-wrap: wrap; gap: 10px; margin: 10px 0 16px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.v-body {
+  white-space: pre-wrap; font-family: var(--mono); font-size: 13px; line-height: 1.65;
+  padding: 16px; border-radius: 16px; min-height: 40%;
+}
+.inspect-pad { flex: 1; overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 12px; }
+.block { padding: 12px; border-radius: 14px; }
+.block h3 { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--cyan); margin-bottom: 8px; }
+.hash {
+  font-family: var(--mono); font-size: 11px; word-break: break-all;
+  padding: 8px; border-radius: 8px; background: rgba(0,0,0,0.4); color: var(--cyan);
+  border: 1px solid var(--line);
+}
+.kv { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; margin: 4px 0; color: var(--muted); }
+.kv b { color: var(--text); font-weight: 600; }
+.bar { height: 8px; border-radius: 99px; background: rgba(255,255,255,0.08); overflow: hidden; }
+.fill { height: 100%; background: linear-gradient(90deg, var(--pink), var(--purple), var(--cyan)); transition: width 0.5s ease; }
+.factor { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 6px; }
+.proto { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.proto i { font-style: normal; display: flex; justify-content: space-between; font-family: var(--mono); font-size: 10px;
+  padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+.drawer-btn {
+  display: none; position: fixed; right: 14px; bottom: 14px; z-index: 30;
+  padding: 10px 14px; border-radius: 999px; border: 1px solid var(--cyan);
+  background: rgba(6,8,13,0.9); color: var(--cyan); font-weight: 700; cursor: pointer;
+}
+.status-line { font-family: var(--mono); font-size: 11px; color: var(--muted); padding: 0 14px 8px; }
+@media (max-width: 1080px) {
+  .stage { grid-template-columns: minmax(200px, 240px) 1fr; }
+  .inspector {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(360px, 92vw); z-index: 25;
+    transform: translateX(105%); transition: transform 0.25s ease;
+  }
+  .inspector.open { transform: none; }
+  .drawer-btn { display: block; }
+}
+@media (max-width: 720px) {
+  .stage { grid-template-columns: 1fr; }
+  .sidebar { display: none; }
+  .sidebar.open { display: flex; position: fixed; inset: 0 20% 0 0; z-index: 24; }
+}
+</style>
 </head>
 <body>
-
-  <header>
-    <div class="brand">
-      <span>🪃</span> FORK BROWSER
+<div class="app">
+  <header class="chrome glass">
+    <div class="wordmark">FORK BROWSER</div>
+    <div class="nav-btns">
+      <button class="icon-btn" id="btnBack" title="Back" onclick="goBack()">←</button>
+      <button class="icon-btn" id="btnFwd" title="Forward" onclick="goFwd()">→</button>
+      <button class="icon-btn" id="btnReload" title="Refresh" onclick="reloadSnap()">↻</button>
+      <button class="icon-btn" id="btnTab" title="New tab" onclick="newTab()">+</button>
     </div>
-    <div class="nav-controls">
-      <button class="nav-btn" onclick="location.reload()" title="Refresh">↻</button>
+    <div class="url-wrap">
+      <span class="scheme"><span class="pulse"></span><span id="currentScheme">HTTPS</span></span>
+      <input id="urlInput" value="https://example.com" placeholder="https://  finger://  dns://  gemini://  gopher://  news://">
     </div>
-    <div class="url-bar-container">
-      <span class="scheme-badge" id="currentScheme">HTTP</span>
-      <input type="text" class="url-input" id="urlInput" value="https://news.ycombinator.com" placeholder="Enter URL (https://, finger://, dns://, gemini://, gopher://, news://)...">
-    </div>
-    <button class="btn-go" onclick="navigateUrl()">Navigate</button>
+    <button class="go" id="btnGo" onclick="navigateUrl()">Navigate</button>
   </header>
-
-  <div class="preset-bar">
-    <span>Quick Sample Presets:</span>
-    <span class="preset-pill" onclick="loadPreset('finger://plan.mit.edu')">finger://plan.mit.edu</span>
-    <span class="preset-pill" onclick="loadPreset('dns://example.com?type=TXT')">dns://example.com?type=TXT</span>
-    <span class="preset-pill" onclick="loadPreset('gemini://capsule.org')">gemini://capsule.org</span>
-    <span class="preset-pill" onclick="loadPreset('gopher://floodgap.com')">gopher://floodgap.com</span>
-    <span class="preset-pill" onclick="loadPreset('news://comp.lang.rust')">news://comp.lang.rust</span>
+  <div class="tabs" id="tabStrip"></div>
+  <div class="presets glass">
+    <label>Protocol testers</label>
+    <button class="pill" onclick="loadPreset('https://example.com')">https://example.com</button>
+    <button class="pill" onclick="loadPreset('finger://telehack.com/cow')">finger://telehack.com/cow</button>
+    <button class="pill" onclick="loadPreset('dns://example.com/TXT')">dns://example.com/TXT</button>
+    <button class="pill" onclick="loadPreset('dns://version.bind?class=CH')">dns CHAOS</button>
+    <button class="pill" onclick="loadPreset('gemini://geminiprotocol.net/')">gemini://geminiprotocol.net</button>
+    <button class="pill" onclick="loadPreset('gopher://gopher.floodgap.com/1')">gopher://floodgap</button>
+    <button class="pill" onclick="loadPreset('news://news.eternal-september.org/')">news://eternal-september</button>
   </div>
-
-  <main>
-    <div class="sidebar">
-      <div class="sidebar-header">
-        <input type="text" class="search-box" id="searchInput" placeholder="Search human web snapshots..." oninput="triggerSearch()">
+  <div class="status-line" id="statusLine">live APIs: /api/snapshots · /api/search · /api/get · /api/snap</div>
+  <div class="stage">
+    <aside class="col sidebar glass" id="sidebar">
+      <div class="col-h">Archive</div>
+      <input id="searchInput" placeholder="Search snapshots…" oninput="triggerSearch()">
+      <div id="snapshotList" class="empty">Loading archive…</div>
+    </aside>
+    <section class="col viewport">
+      <div class="v-title" id="viewTitle">Select a snapshot or navigate</div>
+      <div class="v-meta">
+        <span id="viewUrl">url: none</span>
+        <span id="viewTime">fetched_at: —</span>
+        <span id="viewStatus">status: —</span>
       </div>
-      <div class="snapshot-list" id="snapshotList"></div>
-    </div>
-
-    <div class="viewport">
-      <div class="viewport-header">
-        <div class="view-title" id="viewTitle">Select a snapshot or navigate to a URL</div>
-        <div class="view-meta-bar">
-          <span id="viewUrl">url: none</span>
-          <span id="viewTime">fetched_at: --</span>
-          <span id="viewStatus">status: --</span>
+      <div class="v-body glass" id="viewBody">Fork preserves human web entropy.\n\nUse Navigate or a protocol tester. The inspector shows SHA-256 digests, prior-chain linkage, WWV 10 MHz beacon fields, and tailscore breakdown from live API data.</div>
+    </section>
+    <aside class="col inspector glass" id="inspector">
+      <div class="col-h">Verifiability inspector</div>
+      <div class="inspect-pad">
+        <div class="block glass">
+          <h3>Content hashes</h3>
+          <div class="kv"><span>body_digest</span></div>
+          <div class="hash" id="bodyDigest">sha256:none</div>
+          <div class="kv" style="margin-top:8px"><span>extraction_digest</span></div>
+          <div class="hash" id="extractDigest">sha256:none</div>
+        </div>
+        <div class="block glass">
+          <h3>Per-URL prior chain</h3>
+          <div class="kv">linkage <b id="priorState">genesis</b></div>
+          <div class="hash" id="priorDigest">null</div>
+        </div>
+        <div class="block glass">
+          <h3>WWV 10 MHz beacon</h3>
+          <div class="kv">station <b id="beaconStation">WWV</b></div>
+          <div class="kv">freq <b id="beaconFreq">10000000 Hz</b></div>
+          <div class="kv">captured_at <b id="beaconWhen">—</b></div>
+          <div class="kv">receiver <b id="beaconRx">unattached</b></div>
+          <div class="hash" id="beaconDigest">sha256:none</div>
+        </div>
+        <div class="block glass">
+          <h3>Tailscore humanness</h3>
+          <div class="kv">at-risk score <b id="tailscoreVal">0.00</b></div>
+          <div class="bar"><div class="fill" id="tailscoreFill" style="width:0%"></div></div>
+          <div id="tailFactors"></div>
+        </div>
+        <div class="block glass">
+          <h3>Handlers</h3>
+          <div class="proto" id="protoGrid"></div>
         </div>
       </div>
-      <div class="view-body" id="viewBody">
-Welcome to the Fork Web Browser!
+    </aside>
+  </div>
+</div>
+<button class="drawer-btn" onclick="document.getElementById('inspector').classList.toggle('open')">Inspector</button>
+<script>
+const PRESETS = [];
+let archive = [];
+let tabs = [{ id: 1, title: "start", snap: null }];
+let tabId = 1;
+let activeTab = 1;
+let hist = [];
+let histIdx = -1;
+let busy = false;
 
-Use the address bar above or click any sample preset to browse the preserved web across multiple protocols:
-- https://     Standard HTTP/HTTPS pages
-- finger://    RFC 1288 hacker & academic .plan files
-- dns://       DNS TXT, CAA & CHAOS history records
-- gemini://    Lightweight TLS capsules
-- gopher://    RFC 1436 text menus
-- news://      NNTP Usenet news articles
+function schemeOf(u) {
+  try { return new URL(u).protocol.replace(':',' ').trim().toUpperCase(); }
+  catch { return (u.split(':')[0] || 'URL').toUpperCase(); }
+}
+function $(id) { return document.getElementById(id); }
+function setStatus(s) { $('statusLine').textContent = s; }
+function setBusy(v) {
+  busy = v;
+  $('btnGo').classList.toggle('busy', v);
+  $('btnGo').textContent = v ? 'Fetching…' : 'Navigate';
+}
+function updateScheme(u) { $('currentScheme').textContent = schemeOf(u || $('urlInput').value); }
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[c]);
+}
 
-Select any snapshot on the left sidebar to inspect its SHA-256 verifiability digests, per-URL prior chain, and radio frequency WWV beacon timestamps.
-      </div>
-    </div>
+function renderTabs() {
+  $('tabStrip').innerHTML = tabs.map(t =>
+    '<div class="tab' + (t.id === activeTab ? ' on' : '') + '" onclick="switchTab(' + t.id + ')">' + esc(t.title) + '</div>'
+  ).join('');
+}
+function switchTab(id) {
+  activeTab = id;
+  const t = tabs.find(x => x.id === id);
+  if (t && t.snap) showSnap(t.snap, false);
+  renderTabs();
+}
+function newTab() {
+  tabId += 1;
+  tabs.push({ id: tabId, title: 'tab ' + tabId, snap: null });
+  activeTab = tabId;
+  renderTabs();
+}
+function pushHist(snap) {
+  hist = hist.slice(0, histIdx + 1);
+  hist.push(snap);
+  histIdx = hist.length - 1;
+  $('btnBack').disabled = histIdx <= 0;
+  $('btnFwd').disabled = histIdx >= hist.length - 1;
+}
+function goBack() { if (histIdx > 0) { histIdx--; showSnap(hist[histIdx], false); } }
+function goFwd() { if (histIdx < hist.length - 1) { histIdx++; showSnap(hist[histIdx], false); } }
 
-    <div class="inspector">
-      <div class="inspect-section">
-        <div class="inspect-title">Verifiability Hashes</div>
-        <div style="margin-bottom: 8px;">
-          <div style="font-size:0.72rem; color:var(--text-dim);">Body Digest (SHA-256):</div>
-          <div class="hash-badge" id="bodyDigest">sha256:none</div>
-        </div>
-        <div>
-          <div style="font-size:0.72rem; color:var(--text-dim);">Extraction Digest:</div>
-          <div class="hash-badge" id="extractDigest">sha256:none</div>
-        </div>
-      </div>
+function factorHtml(factors) {
+  if (!Array.isArray(factors) || !factors.length) return '<div class="factor">no factors</div>';
+  return factors.map(f => {
+    const d = Number(f.delta || 0);
+    const sign = d >= 0 ? '+' : '';
+    return '<div class="factor"><span>' + esc(f.label) + '</span><span>' + sign + d.toFixed(2) + '</span></div>';
+  }).join('');
+}
 
-      <div class="inspect-section">
-        <div class="inspect-title">Freshness Beacon Anchor</div>
-        <div style="font-size:0.72rem; color:var(--text-dim); margin-bottom: 4px;">WWV 10MHz Shortwave Beacon Digest:</div>
-        <div class="hash-badge" id="beaconDigest">sha256:wwv-10mhz-beacon-anchored</div>
-      </div>
+function showSnap(snap, recordHist) {
+  if (!snap) return;
+  if (recordHist !== false) pushHist(snap);
+  const title = (snap.meta && snap.meta.title) || snap.url || '(untitled)';
+  $('viewTitle').textContent = title;
+  $('viewUrl').textContent = 'url: ' + (snap.url || 'none');
+  $('viewTime').textContent = 'fetched_at: ' + (snap.fetched_at || '—');
+  $('viewStatus').textContent = 'status: ' + (snap.status != null ? snap.status : '—');
+  $('viewBody').textContent = (snap.meta && snap.meta.text_preview) || '(no extraction)';
+  $('urlInput').value = snap.url || '';
+  updateScheme(snap.url);
+  $('bodyDigest').textContent = snap.body_digest || 'sha256:none';
+  $('extractDigest').textContent = snap.extraction_digest || 'sha256:none';
+  const prior = snap.prior;
+  $('priorState').textContent = prior ? 'linked' : 'genesis';
+  $('priorDigest').textContent = prior || 'null';
+  const b = snap.beacon || {};
+  $('beaconStation').textContent = b.station || 'WWV';
+  $('beaconFreq').textContent = (b.freq_hz || 10000000) + ' Hz';
+  $('beaconWhen').textContent = b.captured_at || snap.fetched_at || '—';
+  $('beaconRx').textContent = b.receiver || 'unattached';
+  $('beaconDigest').textContent = b.digest || 'sha256:none';
+  const score = snap.tailscore != null ? Number(snap.tailscore) : 0;
+  $('tailscoreVal').textContent = score.toFixed(2);
+  $('tailscoreFill').style.width = Math.round(score * 100) + '%';
+  const factors = (snap.meta && snap.meta.tailscore_factors) || [];
+  $('tailFactors').innerHTML = factorHtml(factors);
+  const t = tabs.find(x => x.id === activeTab);
+  if (t) { t.snap = snap; t.title = title.slice(0, 24); }
+  renderTabs();
+  document.querySelectorAll('.card').forEach(el => {
+    el.classList.toggle('on', el.dataset.digest === (snap.body_digest || ''));
+  });
+  setStatus('loaded ' + (snap.url || '') + ' · ' + (snap.body_digest || '').slice(0, 22));
+}
 
-      <div class="inspect-section">
-        <div class="inspect-title">Human Tailscore</div>
-        <div style="display:flex; justify-content:space-between; font-family:var(--font-mono); font-size:0.82rem;">
-          <span>At-Risk Score:</span>
-          <span id="tailscoreVal">0.75</span>
-        </div>
-        <div class="tailscore-bar">
-          <div class="tailscore-fill" id="tailscoreFill" style="width: 75%;"></div>
-        </div>
-      </div>
+function renderList(list) {
+  const box = $('snapshotList');
+  if (!list || !list.length) {
+    box.className = 'empty';
+    box.textContent = 'No snapshots yet. Navigate or hit a protocol tester.';
+    return;
+  }
+  box.className = '';
+  box.innerHTML = list.map(s => {
+    const title = (s.meta && s.meta.title) || s.url || '(untitled)';
+    const digest = s.body_digest || '';
+    return '<div class="card" data-digest="' + esc(digest) + '" onclick="openSnap(\'' + esc(digest) + '\')"><h4>' + esc(title) + '</h4><p>' + esc(s.url) + '</p></div>';
+  }).join('');
+}
 
-      <div class="inspect-section">
-        <div class="inspect-title">Self-Forged Protocols</div>
-        <div class="protocol-grid">
-          <div class="proto-item">HTTP/HTTPS <span class="status-dot"></span></div>
-          <div class="proto-item">Finger <span class="status-dot"></span></div>
-          <div class="proto-item">DNS TXT <span class="status-dot"></span></div>
-          <div class="proto-item">Gemini <span class="status-dot"></span></div>
-          <div class="proto-item">Gopher <span class="status-dot"></span></div>
-          <div class="proto-item">NNTP News <span class="status-dot"></span></div>
-        </div>
-      </div>
-    </div>
-  </main>
+async function loadSnapshots() {
+  try {
+    const res = await fetch('/api/snapshots');
+    archive = await res.json();
+    renderList(archive);
+    const schemes = await (await fetch('/api/protocols')).json();
+    $('protoGrid').innerHTML = (schemes || []).map(s => '<i>' + esc(s) + ' <span class="dot"></span></i>').join('');
+  } catch (e) {
+    $('snapshotList').textContent = 'API error: ' + e;
+  }
+}
 
-  <script>
-    let activeSnapshots = [];
+async function triggerSearch() {
+  const q = $('searchInput').value;
+  try {
+    const res = await fetch('/api/search?q=' + encodeURIComponent(q));
+    renderList(await res.json());
+    setStatus('search q=' + q);
+  } catch (e) { setStatus('search failed: ' + e); }
+}
 
-    async function loadSnapshots() {
-      try {
-        const res = await fetch('/api/snapshots');
-        activeSnapshots = await res.json();
-        renderSnapshotList(activeSnapshots);
-        if (activeSnapshots.length > 0) {
-          selectSnapshot(activeSnapshots[0]);
-        }
-      } catch (err) {
-        console.error('Failed to load snapshots:', err);
-      }
-    }
+async function openSnap(digest) {
+  try {
+    const res = await fetch('/api/get?target=' + encodeURIComponent(digest));
+    if (!res.ok) { setStatus('get failed'); return; }
+    showSnap(await res.json());
+  } catch (e) { setStatus('get error: ' + e); }
+}
 
-    function renderSnapshotList(list) {
-      const container = document.getElementById('snapshotList');
-      container.innerHTML = '';
-      if (list.length === 0) {
-        container.innerHTML = '<div style="padding:12px; font-size:0.8rem; color:var(--text-dim);">No snapshots recorded yet. Use `fork snap <url>` to add pages.</div>';
-        return;
-      }
-      list.forEach(snap => {
-        const card = document.createElement('div');
-        card.className = 'snap-card';
-        const title = snap.meta && snap.meta.title ? snap.meta.title : snap.url;
-        card.innerHTML = `
-          <div class="snap-title">${escapeHtml(title)}</div>
-          <div class="snap-url">${escapeHtml(snap.url)}</div>
-        `;
-        card.onclick = () => selectSnapshot(snap);
-        container.appendChild(card);
-      });
-    }
+async function navigateUrl() {
+  const url = $('urlInput').value.trim();
+  if (!url || busy) return;
+  updateScheme(url);
+  setBusy(true);
+  setStatus('snapping ' + url + ' via protocol handler…');
+  try {
+    const res = await fetch('/api/snap?url=' + encodeURIComponent(url));
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    showSnap(data);
+    await loadSnapshots();
+  } catch (e) {
+    $('viewTitle').textContent = 'Fetch failed';
+    $('viewBody').textContent = String(e);
+    setStatus('snap error: ' + e);
+  } finally { setBusy(false); }
+}
 
-    function selectSnapshot(snap) {
-      document.getElementById('viewTitle').textContent = snap.meta && snap.meta.title ? snap.meta.title : snap.url;
-      document.getElementById('viewUrl').textContent = 'url: ' + snap.url;
-      document.getElementById('viewTime').textContent = 'fetched_at: ' + snap.fetched_at;
-      document.getElementById('viewStatus').textContent = 'status: ' + snap.status;
-      
-      const preview = snap.meta && snap.meta.text_preview ? snap.meta.text_preview : '(no text preview)';
-      document.getElementById('viewBody').textContent = preview;
-
-      document.getElementById('bodyDigest').textContent = snap.body_digest || 'none';
-      document.getElementById('extractDigest').textContent = snap.extraction_digest || 'none';
-
-      const score = snap.tailscore != null ? snap.tailscore : 0.75;
-      document.getElementById('tailscoreVal').textContent = score.toFixed(2);
-      document.getElementById('tailscoreFill').style.width = (score * 100) + '%';
-      
-      document.getElementById('urlInput').value = snap.url;
-      updateSchemeBadge(snap.url);
-    }
-
-    function updateSchemeBadge(url) {
-      const badge = document.getElementById('currentScheme');
-      if (url.startsWith('finger://')) badge.textContent = 'FINGER';
-      else if (url.startsWith('dns://')) badge.textContent = 'DNS';
-      else if (url.startsWith('gemini://')) badge.textContent = 'GEMINI';
-      else if (url.startsWith('gopher://')) badge.textContent = 'GOPHER';
-      else if (url.startsWith('news://')) badge.textContent = 'NNTP';
-      else badge.textContent = 'HTTP';
-    }
-
-    function loadPreset(url) {
-      document.getElementById('urlInput').value = url;
-      navigateUrl();
-    }
-
-    async function triggerSearch() {
-      const q = document.getElementById('searchInput').value;
-      const res = await fetch('/api/search?q=' + encodeURIComponent(q));
-      const hits = await res.json();
-      renderSnapshotList(hits);
-    }
-
-    function navigateUrl() {
-      const url = document.getElementById('urlInput').value;
-      updateSchemeBadge(url);
-      const scheme = document.getElementById('currentScheme').textContent;
-      document.getElementById('viewTitle').textContent = 'Simulated Live Fetch: ' + url;
-      document.getElementById('viewUrl').textContent = 'url: ' + url;
-      document.getElementById('viewTime').textContent = 'fetched_at: ' + new Date().toISOString();
-      document.getElementById('viewStatus').textContent = 'status: 200';
-      document.getElementById('viewBody').textContent = 'Fetching content across self-forged protocol handler [' + scheme + ']...\n\nPayload received and written to content-addressed snapshot store.';
-    }
-
-    function escapeHtml(str) {
-      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    }
-
-    document.getElementById('urlInput').addEventListener('input', (e) => updateSchemeBadge(e.target.value));
-
-    loadSnapshots();
-  </script>
+function loadPreset(u) { $('urlInput').value = u; updateScheme(u); navigateUrl(); }
+function reloadSnap() {
+  const t = tabs.find(x => x.id === activeTab);
+  if (t && t.snap && t.snap.url) { $('urlInput').value = t.snap.url; navigateUrl(); }
+  else navigateUrl();
+}
+$('urlInput').addEventListener('keydown', ev => { if (ev.key === 'Enter') navigateUrl(); });
+$('urlInput').addEventListener('input', () => updateScheme());
+loadSnapshots();
+renderTabs();
+updateScheme();
+</script>
 </body>
 </html>
-"#;
+"###;
