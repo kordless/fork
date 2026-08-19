@@ -3,16 +3,18 @@
 //! Reference implementation of SPEC/snapshot.md + SPEC/entropy.md.
 //! Makes the archive active: you can go back and use it.
 
-pub mod protocol;
+pub mod protocols;
+pub mod server;
 
 use anyhow::{Context, Result};
+use protocols::{extract_links, extract_title, normalize_extraction, ProtocolRegistry};
 use clap::{Parser, Subcommand};
-use scraper::{Html, Selector};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+
 use url::Url;
 
 #[derive(Parser, Debug)]
@@ -65,6 +67,15 @@ enum Commands {
         #[arg(short, long, default_value = "20")]
         limit: usize,
     },
+    /// List registered protocol handlers (http, finger, dns, gemini, gopher, ...)
+    Protocols,
+    /// Launch the interactive Web Browser Client server
+    Serve {
+        #[arg(short, long, default_value = "0.0.0.0:8080")]
+        bind: String,
+        #[arg(short, long, default_value = "./snapshots")]
+        dir: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,87 +118,18 @@ fn sha256_hex(data: &[u8]) -> String {
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
-fn normalize_extraction(html: &str) -> String {
-    let document = Html::parse_document(html);
-    // Strip scripts/styles roughly via text extraction
-    let body_sel = Selector::parse("body").ok();
-    let text = if let Some(sel) = body_sel {
-        document
-            .select(&sel)
-            .next()
-            .map(|el| {
-                el.text()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default()
-    } else {
-        html.split_whitespace().collect::<Vec<_>>().join(" ")
-    };
-    text.chars().take(50_000).collect() // bound size
-}
+
 
 fn extract_meta(url: &Url, html: &str) -> Meta {
-    let document = Html::parse_document(html);
-    let title = Selector::parse("title")
-        .ok()
-        .and_then(|sel| document.select(&sel).next())
-        .map(|el| el.text().collect::<String>().trim().to_string());
-
-    let text_preview = {
-        let norm = normalize_extraction(html);
-        Some(norm.chars().take(1500).collect())
-    };
-
-    let mut links = Vec::new();
-    if let Ok(sel) = Selector::parse("a[href]") {
-        for el in document.select(&sel) {
-            if let Some(href) = el.value().attr("href") {
-                if let Ok(abs) = url.join(href) {
-                    if abs.scheme() == "http" || abs.scheme() == "https" {
-                        let mut clean = abs;
-                        clean.set_fragment(None);
-                        links.push(clean.to_string());
-                    }
-                }
-            }
-        }
-    }
-    links.sort();
-    links.dedup();
-    if links.len() > 200 {
-        links.truncate(200);
-    }
-
     Meta {
-        title,
-        text_preview,
-        links,
+        title: extract_title(html),
+        text_preview: Some(normalize_extraction(html).chars().take(1500).collect()),
+        links: extract_links(url, html),
         final_url: Some(url.to_string()),
     }
 }
 
-async fn fetch_page(url_str: &str) -> Result<(u16, String, Vec<u8>, Option<String>)> {
-    let client = reqwest::Client::builder()
-        .user_agent("Fork/0.1 (+https://fork.local; human-entropy-preservation)")
-        .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(8))
-        .build()?;
 
-    let resp = client.get(url_str).send().await.context("request failed")?;
-    let status = resp.status().as_u16();
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let final_url = resp.url().to_string();
-    let body = resp.bytes().await?.to_vec();
-    Ok((status, final_url, body, content_type))
-}
 
 fn write_snapshot(out: &Path, snap: &Snapshot, body: &[u8]) -> Result<PathBuf> {
     fs::create_dir_all(out)?;
@@ -228,24 +170,34 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Snap { url, out, prior, tailscore } => {
             println!("fork snap: {}", url);
-            let (status, final_url, body, content_type) = fetch_page(&url).await?;
+            let registry = ProtocolRegistry::builtins();
+            let payload = registry.fetch(&url).await?;
+            let body = payload.raw_bytes;
+            let status = payload.status;
+            let content_type = payload.content_type;
+            let final_url = payload.final_url.clone().unwrap_or_else(|| url.clone());
             let body_digest = sha256_hex(&body);
 
-            let extraction = if content_type.as_deref().map(|c| c.contains("html")).unwrap_or(false) {
-                let html = String::from_utf8_lossy(&body);
-                let norm = normalize_extraction(&html);
-                Some(sha256_hex(norm.as_bytes()))
+            let extraction = if !payload.extracted_text.is_empty() {
+                Some(sha256_hex(payload.extracted_text.as_bytes()))
             } else {
                 None
             };
 
-            let meta = if content_type.as_deref().map(|c| c.contains("html")).unwrap_or(false) {
+            let meta = if payload.title.is_some() || !payload.links.is_empty() {
+                Meta {
+                    title: payload.title,
+                    text_preview: Some(payload.extracted_text.chars().take(1500).collect()),
+                    links: payload.links,
+                    final_url: Some(final_url.clone()),
+                }
+            } else if content_type.as_deref().map(|c| c.contains("html")).unwrap_or(false) {
                 let u = Url::parse(&final_url).unwrap_or_else(|_| Url::parse(&url).unwrap());
                 extract_meta(&u, &String::from_utf8_lossy(&body))
             } else {
                 Meta {
                     title: None,
-                    text_preview: Some(String::from_utf8_lossy(&body).chars().take(500).collect()),
+                    text_preview: Some(payload.extracted_text.chars().take(1500).collect()),
                     links: vec![],
                     final_url: Some(final_url.clone()),
                 }
@@ -416,6 +368,18 @@ async fn main() -> Result<()> {
                 println!("   {}", path.display());
                 println!();
             }
+        }
+
+        Commands::Protocols => {
+            let registry = ProtocolRegistry::builtins();
+            println!("registered protocol handlers:");
+            for scheme in registry.schemes() {
+                println!("  {scheme}");
+            }
+        }
+
+        Commands::Serve { bind, dir } => {
+            server::run_server(&bind, dir).await?;
         }
     }
 

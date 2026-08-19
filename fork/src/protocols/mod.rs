@@ -1,8 +1,7 @@
 //! Protocol abstraction module for Fork + Sigil integration.
 //!
-//! Provides the `ProtocolHandler` trait and dynamic `ProtocolRegistry` so
-//! autonomous Sigil agents can scaffold and register new protocols (HTTP, DNS,
-//! Finger, Gopher, Gemini, FTP, News) on demand.
+//! Phase 1 handlers live here (`http`, `finger`, `dns`, `gemini`, `gopher`).
+//! Autonomous Sigil agents register additional schemes on demand.
 
 mod dns;
 mod finger;
@@ -56,7 +55,7 @@ impl ProtocolRegistry {
         }
     }
 
-    /// Built-in handlers shipped with Fork (http(s), dns, finger, gopher, gemini, ftp, news/nntp).
+    /// Built-in handlers shipped with Fork.
     pub fn builtins() -> Self {
         let mut registry = Self::new();
         if let Ok(client) = http::HttpHandler::shared_client() {

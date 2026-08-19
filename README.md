@@ -47,6 +47,8 @@ cargo run -p fork -- tailscore https://some.personal.site
 | `fork diff a b` | Compare two snapshots |
 | `fork search <query>` | Keyword search over local snapshots |
 | `fork tailscore <url>` | Placeholder at-risk / humanness score |
+| `fork protocols` | List built-in protocol handlers (`http`, `finger`, `dns`, …) |
+| `fork serve` | Local web browser over the snapshot collection |
 
 ## Layout
 
@@ -66,7 +68,7 @@ Fork integrates with **[Sigil](https://github.com/DeepBlueDynamics/sigil)** — 
 Each Fork instance runs a local model agent. When a node encounters an unhandled protocol URL scheme (`dns://`, `finger://`, `gopher://`, `gemini://`, `ftp://`, `news://`), Sigil orchestrates the workflow:
 1. **Self-Forging Protocol Extension**: The agent autonomously scaffolds, verifies, and tests a new Rust `ProtocolHandler` implementation matching the Fork specification.
 2. **Automated CI & Merge**: The agent generates tests, runs verification, and opens a GitHub Pull Request to merge the new protocol component back into `kordless/fork` without requiring manual developer coding.
-3. **Pluggable Protocol Trait**: All network extensions implement `ProtocolHandler` under `fork::protocol`, keeping snapshot hashing, WARC digests, and `tailscore` evaluation consistent across all transport layers.
+3. **Pluggable Protocol Trait**: All network extensions implement `ProtocolHandler` under `fork/src/protocols/`, keeping snapshot hashing, WARC digests, and `tailscore` evaluation consistent across all transport layers.
 
 ## Scope
 
