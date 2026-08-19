@@ -35,6 +35,14 @@ cargo run -p fork -- search "some terms"
 
 # Rough prioritization heuristic
 cargo run -p fork -- tailscore https://some.personal.site
+
+# List built-in protocol handlers
+cargo run -p fork -- protocols
+
+# Snap via non-HTTP schemes
+cargo run -p fork -- snap 'finger://example.com/user'
+cargo run -p fork -- snap 'dns://example.com/TXT'
+cargo run -p fork -- snap 'dns://version.bind?class=CH'
 ```
 
 ## Commands
