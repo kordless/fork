@@ -26,3 +26,4 @@ async-trait = "0.1"
 scraper = "0.20"
 regex = "1"
 walkdir = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
