@@ -147,7 +147,7 @@ impl ProtocolHandler for GeminiHandler {
     }
 }
 
-struct GeminiParsed {
+pub(crate) struct GeminiParsed {
     status: u8,
     meta: Option<String>,
     body_text: String,
