@@ -1,7 +1,3 @@
-<<<<<<< HEAD
-# fork
-Fork the Internet
-=======
 # Fork
 
 **Fork preserves the web's human entropy — versioned, hash-anchored, and copied into enough hands that no one can quietly rewrite it, delete it, or drown it in synthetic sameness.**
@@ -69,7 +65,7 @@ Fork integrates with **[Sigil](https://github.com/DeepBlueDynamics/sigil)** — 
 
 Each Fork instance runs a local model agent. When a node encounters an unhandled protocol URL scheme (`dns://`, `finger://`, `gopher://`, `gemini://`, `ftp://`, `news://`), Sigil orchestrates the workflow:
 1. **Self-Forging Protocol Extension**: The agent autonomously scaffolds, verifies, and tests a new Rust `ProtocolHandler` implementation matching the Fork specification.
-2. **Automated CI & Merge**: The agent generates tests, runs verification, and opens a GitHub Pull Request to merge the new protocol component back into `DeepBlueDynamics/fork` without requiring manual developer coding.
+2. **Automated CI & Merge**: The agent generates tests, runs verification, and opens a GitHub Pull Request to merge the new protocol component back into `kordless/fork` without requiring manual developer coding.
 3. **Pluggable Protocol Trait**: All network extensions implement `ProtocolHandler` under `fork::protocol`, keeping snapshot hashing, WARC digests, and `tailscore` evaluation consistent across all transport layers.
 
 ## Scope
@@ -86,4 +82,3 @@ The history is the only branch you can actually check out — and then run.
 
 ---
 Started 2026-08-19 · DeepBlue Dynamics
->>>>>>> c62083d (Initial commit: Fork active web archive, multi-protocol engine, grubcrawler, and specs)
